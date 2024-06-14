@@ -240,6 +240,21 @@ typedef struct {
 	unsigned char colorspace;
 } qoi_desc;
 
+typedef union {
+	struct { unsigned char r, g, b, a; } rgba;
+	unsigned int v;
+} qoi_rgba_t;
+
+/* Used when doing compression on blocks */
+typedef struct {
+	int offset;
+	int remaining;
+	int bufsize;
+	int run;
+	qoi_rgba_t px_prev_last_block;
+	qoi_rgba_t index[64];
+} qoi_enc_state;
+
 #ifndef QOI_NO_STDIO
 
 /* Encode raw RGB or RGBA pixels into a QOI image and write it to the file
@@ -276,6 +291,20 @@ is set to the size in bytes of the encoded data.
 The returned qoi data should be free()d after use. */
 
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
+
+
+/* Encode raw RGB or RGBA pixels into a QOI image in memory.
+
+This function is designed to work for low memory footprint.
+It serializes the encoding process by keeping the current encoding state
+and it uses it for the next data block.
+
+The function either returns NULL on failure (invalid parameters or malloc
+failed) or a pointer to the encoded data on success. On success the out_len
+is set to the size in bytes of the encoded data.
+
+/* The returned qoi data should be free()d after use. */
+void *qoi_encode_block(const void *data, const qoi_desc *desc, qoi_enc_state *state, int *out_len);
 
 
 /* Decode a QOI image from memory.
@@ -330,11 +359,6 @@ against anything larger than that, assuming the worst case with 5 bytes per
 pixel, rounded down to a nice clean value. 400 million pixels ought to be
 enough for anybody. */
 #define QOI_PIXELS_MAX ((unsigned int)400000000)
-
-typedef union {
-	struct { unsigned char r, g, b, a; } rgba;
-	unsigned int v;
-} qoi_rgba_t;
 
 static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
 
@@ -479,6 +503,164 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
 		bytes[p++] = qoi_padding[i];
+	}
+
+	*out_len = p;
+	return bytes;
+}
+
+void *qoi_encode_block(const void *data, const qoi_desc *desc, qoi_enc_state *state, int *out_len)
+{
+	int i, max_size, p, run;
+	int px_len, px_end, px_pos, channels;
+	unsigned char *bytes;
+	const unsigned char *pixels;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px, px_prev;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	p = 0;
+	if (state->offset == 0) {
+		max_size = state->bufsize + QOI_HEADER_SIZE;
+	} else if (state->offset > 0 && state->remaining > state->bufsize) {
+		max_size = state->bufsize;
+	} else if (state->offset > 0 && state->remaining <= state->bufsize) {
+		max_size = state->bufsize + sizeof(qoi_padding);
+	} else {
+		return NULL;
+	}
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	if (state->offset == 0) {
+		qoi_write_32(bytes, &p, QOI_MAGIC);
+		qoi_write_32(bytes, &p, desc->width);
+		qoi_write_32(bytes, &p, desc->height);
+		bytes[p++] = desc->channels;
+		bytes[p++] = desc->colorspace;
+	}
+
+	pixels = (const unsigned char *)data;
+
+	if (state->offset == 0) {
+		QOI_ZEROARR(index);
+		run = 0;
+		px_prev.rgba.r = 0;
+		px_prev.rgba.g = 0;
+		px_prev.rgba.b = 0;
+		px_prev.rgba.a = 255;
+	} else {
+		memcpy(index, state->index, 64 * sizeof(qoi_rgba_t));
+		run = state->run;
+		px_prev.rgba.r = state->px_prev_last_block.rgba.r;
+		px_prev.rgba.g = state->px_prev_last_block.rgba.g;
+		px_prev.rgba.b = state->px_prev_last_block.rgba.b;
+		px_prev.rgba.a = state->px_prev_last_block.rgba.a;
+	}
+	px = px_prev;
+
+	px_len = state->bufsize;
+	px_end = desc->width * desc->height * (desc->channels - 1);
+	channels = desc->channels;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		px.rgba.r = pixels[px_pos + 0];
+		px.rgba.g = pixels[px_pos + 1];
+		px.rgba.b = pixels[px_pos + 2];
+
+		if (channels == 4) {
+			px.rgba.a = pixels[px_pos + 3];
+		}
+
+		if (px.v == px_prev.v) {
+			run++;
+			if (run == 62 || px_pos + state->offset == px_end) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+		}
+		else {
+			int index_pos;
+
+			if (run > 0) {
+				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run = 0;
+			}
+
+			index_pos = QOI_COLOR_HASH(px) % 64;
+
+			if (index[index_pos].v == px.v) {
+				bytes[p++] = QOI_OP_INDEX | index_pos;
+			}
+			else {
+				index[index_pos] = px;
+
+				if (px.rgba.a == px_prev.rgba.a) {
+					signed char vr = px.rgba.r - px_prev.rgba.r;
+					signed char vg = px.rgba.g - px_prev.rgba.g;
+					signed char vb = px.rgba.b - px_prev.rgba.b;
+
+					signed char vg_r = vr - vg;
+					signed char vg_b = vb - vg;
+
+					if (
+						vr > -3 && vr < 2 &&
+						vg > -3 && vg < 2 &&
+						vb > -3 && vb < 2
+					) {
+						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+					}
+					else if (
+						vg_r >  -9 && vg_r <  8 &&
+						vg   > -33 && vg   < 32 &&
+						vg_b >  -9 && vg_b <  8
+					) {
+						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					}
+					else {
+						bytes[p++] = QOI_OP_RGB;
+						bytes[p++] = px.rgba.r;
+						bytes[p++] = px.rgba.g;
+						bytes[p++] = px.rgba.b;
+					}
+				}
+				else {
+					bytes[p++] = QOI_OP_RGBA;
+					bytes[p++] = px.rgba.r;
+					bytes[p++] = px.rgba.g;
+					bytes[p++] = px.rgba.b;
+					bytes[p++] = px.rgba.a;
+				}
+			}
+		}
+		px_prev = px;
+	}
+	state->offset += state->bufsize;
+	state->remaining -= state->bufsize;
+	memcpy(state->index, index, 64 * sizeof(qoi_rgba_t));
+	state->run = run;
+	state->px_prev_last_block.rgba.r = px.rgba.r;
+	state->px_prev_last_block.rgba.g = px.rgba.g;
+	state->px_prev_last_block.rgba.b = px.rgba.b;
+	state->px_prev_last_block.rgba.a = px.rgba.a;
+
+	if (state->remaining == 0)
+	{
+		for (i = 0; i < (int)sizeof(qoi_padding); i++) {
+			bytes[p++] = qoi_padding[i];
+		}
 	}
 
 	*out_len = p;
